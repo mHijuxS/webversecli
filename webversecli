@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""WebVerse Labs CLI — mirrors htbcli/hccli usage patterns."""
+
+import argparse
+import getpass
+import gzip
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CONFIG_PATH = Path.home() / ".config" / "webversecli" / "config.json"
+BASE_URL = "https://api.webverselabs-pro.com"
+DASHBOARD = "https://dashboard.webverselabs-pro.com"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+
+def _c(code, text): return f"\033[{code}m{text}\033[0m"
+def ok(msg):   print(_c("32", f"[+] {msg}"))
+def err(msg):  print(_c("31", f"[-] {msg}"), file=sys.stderr)
+def info(msg): print(_c("36", f"[*] {msg}"))
+def warn(msg): print(_c("33", f"[!] {msg}"))
+
+def table(headers, rows):
+    if not rows:
+        return
+    widths = [max(len(str(r[i])) for r in ([headers] + rows)) for i in range(len(headers))]
+    sep = "  "
+    print(_c("1", sep.join(str(h).ljust(widths[i]) for i, h in enumerate(headers))))
+    print(_c("90", sep.join("-" * w for w in widths)))
+    for row in rows:
+        print(sep.join(str(v).ljust(widths[i]) for i, v in enumerate(row)))
+
+# ── Config management ─────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text())
+    return {}
+
+def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+def get_token() -> str:
+    token = os.environ.get("WEBVERSECLI_TOKEN") or load_config().get("token", "")
+    if not token:
+        err("No token set. Run: webversecli config login  OR  webversecli config set-token TOKEN")
+        sys.exit(1)
+    return token
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+
+def _req(path: str, method: str = "GET", body=None, raw: bool = False, no_auth: bool = False):
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0",
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "Referer": f"{DASHBOARD}/",
+        "Origin": DASHBOARD,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
+    }
+    if not no_auth:
+        hdrs["Cookie"] = f"token={get_token()}"
+    req = urllib.request.Request(BASE_URL + path, headers=hdrs, method=method)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+        req.data = json.dumps(body).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+            if raw:
+                return data, r
+            return json.loads(data) if data else {}
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        try:
+            if e.headers.get("Content-Encoding") == "gzip":
+                data = gzip.decompress(data)
+        except Exception:
+            pass
+        try:
+            parsed = json.loads(data)
+            detail = parsed.get("detail", str(parsed))
+            if isinstance(detail, list):
+                detail = "; ".join(str(x) for x in detail)
+        except Exception:
+            detail = data.decode(errors="replace")
+        err(f"HTTP {e.code}: {detail}")
+        sys.exit(1)
+    except Exception as ex:
+        err(f"Request failed: {ex}")
+        sys.exit(1)
+
+def _get(path): return _req(path)
+def _post(path, body=None): return _req(path, "POST", body)
+def _get_raw(path):
+    data, _ = _req(path, raw=True)
+    return data
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _read_flag(flag_arg):
+    if flag_arg:
+        return flag_arg.strip()
+    if not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return input("Flag: ").strip()
+
+def _free_badge(is_free):
+    return _c("32", "free") if is_free else _c("90", "pro")
+
+def _fmt_time(ts):
+    return ts.replace("T", " ").split(".")[0].split("+")[0] if ts else "N/A"
+
+def _match(text, query):
+    return not query or query.lower() in text.lower()
+
+def _bar(done, total, width=20):
+    if not total:
+        return "[" + " " * width + "] 0%"
+    pct = int(done / total * 100)
+    filled = int(done / total * width)
+    return f"[{'█' * filled}{'░' * (width - filled)}] {pct}%"
+
+# ── Commands: config ──────────────────────────────────────────────────────────
+
+def cmd_config_login(args):
+    email = args.email or input("Email: ").strip()
+    password = args.password or getpass.getpass("Password: ")
+    body = {"email": email, "password": password}
+    try:
+        data, resp = _req("/api/auth/login", "POST", body, raw=True, no_auth=True)
+        if resp.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+        parsed = json.loads(data)
+    except SystemExit:
+        return  # err() already printed
+
+    token = parsed.get("token") or parsed.get("access_token") or parsed.get("jwt")
+    if not token:
+        # Try to extract from Set-Cookie if returned in headers
+        err(f"Login succeeded but no token in response: {parsed}")
+        sys.exit(1)
+
+    cfg = load_config()
+    cfg["token"] = token
+    save_config(cfg)
+    ok(f"Logged in. Token saved.")
+
+def cmd_config_logout(_args):
+    _post("/api/auth/logout")
+    cfg = load_config()
+    cfg.pop("token", None)
+    save_config(cfg)
+    ok("Logged out and token cleared.")
+
+def cmd_config_set_token(args):
+    cfg = load_config()
+    cfg["token"] = args.token
+    save_config(cfg)
+    ok("Token saved.")
+
+def cmd_config_show(_args):
+    token = os.environ.get("WEBVERSECLI_TOKEN") or load_config().get("token", "")
+    if token:
+        masked = token[:20] + "..." + token[-8:]
+        src = "env $WEBVERSECLI_TOKEN" if os.environ.get("WEBVERSECLI_TOKEN") else CONFIG_PATH
+        info(f"Token : {masked}")
+        info(f"Source: {src}")
+    else:
+        warn("No token configured. Run: webversecli config login")
+
+# ── Commands: me ──────────────────────────────────────────────────────────────
+
+def cmd_me(args):
+    action = getattr(args, "me_action", None) or "profile"
+    if action == "profile":
+        d = _get("/api/auth/me")
+        info(f"User    : {d.get('username')}  (ID {d.get('id')})")
+        info(f"Email   : {d.get('email')}")
+        info(f"Pro     : {d.get('pro_status')}  |  All-access: {d.get('is_all_access')}")
+        info(f"VPN IP  : {d.get('vpn_ip')}  |  Connected: {d.get('vpn_connected')}")
+        info(f"Streak  : {d.get('solve_streak')} current  (best: {d.get('best_streak')})")
+    elif action == "stats":
+        d = _get("/api/user/stats")
+        info(f"Rank    : {d.get('rank')}  →  {d.get('next_rank')}  ({d.get('xp')}/{d.get('next_rank_xp')} XP)")
+        print()
+        info(f"Labs    : {d.get('labs_solved')}/{d.get('labs_total')}  {_bar(d.get('labs_solved',0), d.get('labs_total',1))}")
+        info(f"Chals   : {d.get('challenges_solved')}/{d.get('challenges_total')}  {_bar(d.get('challenges_solved',0), d.get('challenges_total',1))}")
+        print()
+        info(f"First bloods : {d.get('first_bloods_count')}  (labs: {d.get('lab_first_bloods')}, chals: {d.get('challenge_first_bloods')})")
+        info(f"Streak : {d.get('solve_streak')} current  (best: {d.get('best_streak')}, freezes left: {d.get('streak_freezes_remaining')})")
+        info(f"Avg solve time: {int(d.get('avg_solve_time', 0) / 60)} min")
+        db = d.get("difficulty_breakdown", {})
+        if db:
+            print()
+            rows = []
+            for diff, v in db.items():
+                rows.append([diff, str(v.get("solved", 0)), str(v.get("total", 0)), str(v.get("xp", 0))])
+            table(["Difficulty", "Solved", "Total", "XP"], rows)
+    elif action == "progress":
+        d = _get("/api/user/progress")
+        info(f"Rank: {d.get('rank')}  XP: {d.get('xp')}/{d.get('next_rank_xp')}  {_bar(d.get('xp',0) - d.get('rank_floor_xp',0), d.get('next_rank_xp',1) - d.get('rank_floor_xp',0))}")
+        info(f"Labs completed: {d.get('completed_count')}/{d.get('total_labs')}")
+        slugs = d.get("completed_slugs", [])
+        if slugs:
+            for i in range(0, len(slugs), 5):
+                print("  " + "  ".join(slugs[i:i+5]))
+        chal_slugs = d.get("completed_challenge_slugs", [])
+        if chal_slugs:
+            info(f"Challenges completed: {len(chal_slugs)}")
+            for i in range(0, len(chal_slugs), 5):
+                print("  " + "  ".join(chal_slugs[i:i+5]))
+    elif action == "achievements":
+        d = _get("/api/user/achievements")
+        achs = d.get("achievements", [])
+        unlocked = [a for a in achs if a.get("unlocked")]
+        locked   = [a for a in achs if not a.get("unlocked") and not a.get("is_hidden")]
+        info(f"Achievements: {len(unlocked)}/{len(achs)} unlocked")
+        print()
+        if unlocked:
+            info("Unlocked:")
+            rows = [[a["id"], a["name"], a.get("rarity",""), a.get("description","")[:60],
+                     _fmt_time(a.get("unlocked_at",""))] for a in unlocked]
+            table(["ID", "Name", "Rarity", "Description", "Unlocked At"], rows)
+        if locked:
+            print()
+            info("Locked (visible):")
+            rows = [[a["id"], a["name"], a.get("rarity",""), a.get("description","")[:60]] for a in locked]
+            table(["ID", "Name", "Rarity", "Description"], rows)
+
+# ── Commands: labs ────────────────────────────────────────────────────────────
+
+def cmd_labs_list(args):
+    data = _get("/api/labs")
+    foundational = _get("/api/foundational-labs")
+    all_labs = list(data) + list(foundational)
+    rows = []
+    for lab in all_labs:
+        is_free = lab.get("is_free") or lab.get("is_effectively_free", False)
+        if args.free and not is_free:
+            continue
+        if args.difficulty and lab.get("difficulty", "").lower() != args.difficulty.lower():
+            continue
+        if args.tag and args.tag.lower() not in [t.lower() for t in lab.get("tags", [])]:
+            continue
+        if args.search and not (_match(lab.get("name",""), args.search) or
+                                _match(lab.get("description",""), args.search) or
+                                any(_match(t, args.search) for t in lab.get("tags", []))):
+            continue
+        rows.append([
+            lab["slug"],
+            lab["name"],
+            lab["difficulty"],
+            _free_badge(is_free),
+            str(lab.get("total_solves", "")),
+            ", ".join(lab.get("tags", [])[:3]),
+        ])
+    if not rows:
+        info("No labs match the given filters.")
+        return
+    table(["Slug", "Name", "Difficulty", "Access", "Solves", "Tags"], rows)
+    info(f"{len(rows)} lab(s) shown.")
+
+def cmd_labs_filters(_args):
+    d = _get("/api/labs/filters")
+    fd = _get("/api/foundational-labs/filters")
+    info("Lab difficulties:")
+    print("  " + ", ".join(d.get("difficulties", []) + fd.get("difficulties", [])))
+    info("Lab tags (alphabetical):")
+    tags = sorted(set(d.get("tags", []) + fd.get("tags", [])))
+    for i in range(0, len(tags), 6):
+        print("  " + "  ".join(tags[i:i+6]))
+    info("Technologies:")
+    techs = sorted(set(d.get("technologies", []) + fd.get("technologies", [])))
+    for i in range(0, len(techs), 6):
+        print("  " + "  ".join(techs[i:i+6]))
+
+def cmd_labs_show(args):
+    d = _get(f"/api/labs/{args.slug}")
+    info(f"{d['name']} [{d['slug']}] — {d['difficulty']}")
+    print()
+    print(d.get("description", "").strip())
+    if d.get("story"):
+        print()
+        print(_c("90", d["story"].strip()))
+    print()
+    info(f"XP       : {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
+    info(f"Free     : {d.get('is_free')}  |  Writeup: {d.get('has_writeup')}")
+    info(f"Tags     : {', '.join(d.get('tags') or [])}")
+    info(f"Tech     : {', '.join(d.get('technologies') or [])}")
+    if d.get("learning_objectives"):
+        info("Objectives:")
+        for obj in d["learning_objectives"]:
+            print(f"  • {obj}")
+    fb = d.get("first_blood")
+    if fb:
+        info(f"First blood: {fb.get('username')} @ {_fmt_time(fb.get('solved_at',''))}")
+    if d.get("hostnames"):
+        info(f"Hostnames: {', '.join(d['hostnames'])}")
+
+def cmd_labs_start(args):
+    d = _post(f"/api/labs/{args.slug}/start")
+    ok(f"Lab started: {d.get('lab_name')} ({d.get('difficulty')})")
+    info(f"Gateway IP : {d.get('gateway_ip')}")
+    info(f"Hostnames  : {', '.join(d.get('hostnames', []))}")
+    info(f"Hosts entry: {d.get('hosts_file_entry')}")
+    info(f"Expires at : {_fmt_time(d.get('expires_at', ''))}")
+
+def cmd_labs_stop(_args):
+    d = _post("/api/labs/stop")
+    ok(d.get("message", "Stopped."))
+
+def cmd_labs_active(_args):
+    d = _get("/api/labs/active")
+    lab = d.get("active_lab")
+    if not lab:
+        info("No active lab.")
+        return
+    ok(f"Active lab: {lab['lab_name']} ({lab['difficulty']})")
+    info(f"Gateway IP : {lab.get('gateway_ip')}")
+    info(f"Hostnames  : {', '.join(lab.get('hostnames', []))}")
+    info(f"Hosts entry: {lab.get('hosts_file_entry')}")
+    info(f"Expires at : {_fmt_time(lab.get('expires_at', ''))}")
+    info(f"Status     : {lab.get('status')}")
+
+def cmd_labs_submit(args):
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+    d = _post(f"/api/labs/{args.slug}/submit-flag", {"flag": flag})
+    if d.get("correct"):
+        ok(f"Correct! {d.get('message', '')}")
+    else:
+        err(f"Wrong flag. {d.get('message', '')}")
+        sys.exit(1)
+
+def cmd_labs_writeup(args):
+    slug = args.slug
+    dest = args.output or os.path.expanduser(f"~/{slug}-writeup.pdf")
+    info(f"Downloading writeup for {slug}...")
+    data = _get_raw(f"/api/labs/{slug}/writeup")
+    Path(dest).write_bytes(data)
+    ok(f"Saved to {dest}  ({len(data)//1024} KB)")
+
+# ── Commands: challenges ──────────────────────────────────────────────────────
+
+def cmd_challenges_list(args):
+    data = _get("/api/challenges")
+    rows = []
+    for ch in data:
+        if args.free and not ch.get("is_free"):
+            continue
+        if args.difficulty and ch.get("difficulty", "").lower() != args.difficulty.lower():
+            continue
+        if args.category and ch.get("category", "").lower() != args.category.lower():
+            continue
+        if args.search and not (_match(ch.get("name",""), args.search) or
+                                _match(ch.get("description",""), args.search) or
+                                _match(ch.get("category",""), args.search)):
+            continue
+        rows.append([
+            ch["slug"],
+            ch["name"][:38],
+            ch.get("category", ""),
+            ch["difficulty"],
+            _free_badge(ch.get("is_free", False)),
+            str(ch.get("xp_reward", "")),
+            str(ch.get("total_solves", "")),
+        ])
+    if not rows:
+        info("No challenges match the given filters.")
+        return
+    table(["Slug", "Name", "Category", "Difficulty", "Access", "XP", "Solves"], rows)
+    info(f"{len(rows)} challenge(s) shown.")
+
+def cmd_challenges_show(args):
+    d = _get(f"/api/challenges/{args.slug}")
+    info(f"{d['name']} [{d['slug']}] — {d['difficulty']}")
+    print(d.get("description", "").strip())
+    print()
+    info(f"Category: {d.get('category')}  |  XP: {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
+    info(f"Free: {d.get('is_free')}")
+
+def cmd_challenges_start(args):
+    d = _post(f"/api/challenges/{args.slug}/start")
+    ok(f"Challenge started: {d.get('challenge_name')}")
+    info(f"URL: {d.get('url')}")
+    info(f"Expires at: {_fmt_time(d.get('expires_at', ''))}")
+
+def cmd_challenges_stop(_args):
+    d = _post("/api/challenges/stop")
+    ok(d.get("message", "Stopped."))
+
+def cmd_challenges_active(_args):
+    d = _get("/api/challenges/active")
+    ch = d.get("active_challenge")
+    if not ch:
+        info("No active challenge.")
+        return
+    ok(f"Active challenge: {ch['challenge_name']}")
+    info(f"URL: {ch.get('url')}")
+    info(f"Expires at: {_fmt_time(ch.get('expires_at', ''))}")
+
+def cmd_challenges_submit(args):
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+    d = _post(f"/api/challenges/{args.slug}/submit-flag", {"flag": flag})
+    if d.get("correct"):
+        ok(f"Correct! {d.get('message', '')}")
+    else:
+        err(f"Wrong flag. {d.get('message', '')}")
+        sys.exit(1)
+
+# ── Commands: events ──────────────────────────────────────────────────────────
+
+def _resolve_event(slug_or_id: str):
+    events = _get("/api/events")
+    for ev in events:
+        if (str(ev["event_id"]) == str(slug_or_id) or
+                ev.get("slug") == slug_or_id or
+                ev.get("package_slug") == slug_or_id):
+            return ev["event_id"], ev.get("slug") or ev.get("package_slug")
+    err(f"Event not found: {slug_or_id}")
+    sys.exit(1)
+
+def cmd_events_list(_args):
+    data = _get("/api/events")
+    rows = []
+    for ev in data:
+        rows.append([
+            str(ev["event_id"]),
+            ev.get("slug") or ev.get("package_slug", ""),
+            ev.get("name") or ev.get("package_name", ""),
+            ev.get("kind", ""),
+            ev.get("state", ""),
+            ev.get("category", ""),
+            ev.get("difficulty", ""),
+            _fmt_time(ev.get("ends_at", "")),
+        ])
+    table(["ID", "Slug", "Name", "Kind", "State", "Category", "Difficulty", "Ends At"], rows)
+
+def cmd_events_show(args):
+    event_id, slug = _resolve_event(args.slug)
+    d = _get(f"/api/events/{slug}")
+    info(f"{d.get('package_name')} [{slug}] (ID {event_id}) — {d.get('difficulty')}")
+    print(d.get("description", "").strip())
+    print()
+    info(f"Category: {d.get('category')}  |  XP: {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
+    info(f"Kind: {d.get('kind')}  |  State: {d.get('state')}")
+    info(f"Ends: {_fmt_time(d.get('ends_at',''))}")
+    if d.get("user_completed"):
+        ok("You have already solved this event.")
+    fb = d.get("first_blood")
+    if fb:
+        info(f"First blood: {fb.get('username')} @ {_fmt_time(fb.get('solved_at',''))}")
+
+def cmd_events_start(args):
+    event_id, _ = _resolve_event(args.slug)
+    d = _post(f"/api/events/{event_id}/start")
+    ok(f"Event started: {d.get('package_name')}")
+    info(f"URL: {d.get('url')}")
+
+def cmd_events_stop(_args):
+    d = _post("/api/events/stop")
+    ok(d.get("message", "Stopped."))
+
+def cmd_events_active(_args):
+    d = _get("/api/events/active")
+    ev = d.get("active_event")
+    if not ev:
+        info("No active event.")
+        return
+    ok(f"Active event: {ev.get('package_name') or ev.get('name')}")
+    info(f"URL: {ev.get('url')}")
+
+def cmd_events_submit(args):
+    event_id, _ = _resolve_event(args.slug)
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+    d = _post(f"/api/events/{event_id}/submit-flag", {"flag": flag})
+    if d.get("correct"):
+        ok(f"Correct! {d.get('message', '')}")
+    else:
+        err(f"Wrong flag. {d.get('message', '')}")
+        sys.exit(1)
+
+# ── Commands: ranges ──────────────────────────────────────────────────────────
+
+def cmd_ranges_list(_args):
+    data = _get("/api/ranges")
+    rows = []
+    for r in data:
+        rows.append([
+            r["slug"],
+            r["name"],
+            r["difficulty"],
+            str(r.get("total_flags", "")),
+            f"{r.get('estimated_hours_min','')}-{r.get('estimated_hours_max','')}h",
+            str(r.get("total_xp", "")),
+            ", ".join(r.get("tags", [])[:3]),
+        ])
+    table(["Slug", "Name", "Difficulty", "Flags", "Est. Time", "XP", "Tags"], rows)
+
+def cmd_ranges_show(args):
+    d = _get(f"/api/ranges/{args.slug}")
+    info(f"{d['name']} [{d['slug']}] — {d['difficulty']}")
+    print(d.get("summary", "").strip())
+    print()
+    info(f"Flags: {d.get('total_flags')}  |  XP: {d.get('total_xp')}")
+    info(f"Est. time: {d.get('estimated_hours_min')}-{d.get('estimated_hours_max')}h")
+    info(f"Tags: {', '.join(d.get('tags', []))}")
+    info(f"Tech: {', '.join(d.get('technologies', []))}")
+
+def cmd_ranges_start(args):
+    d = _post(f"/api/ranges/{args.slug}/start")
+    ok(f"Range started: {d.get('range_name', args.slug)}")
+
+def cmd_ranges_stop(_args):
+    d = _post("/api/ranges/stop")
+    ok(d.get("message", "Stopped."))
+
+def cmd_ranges_active(_args):
+    d = _get("/api/ranges/active")
+    rng = d.get("active_range")
+    if not rng:
+        info("No active range.")
+        return
+    ok(f"Active range: {rng.get('range_name', rng.get('slug', ''))}")
+
+def cmd_ranges_submit(args):
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+    d = _post(f"/api/ranges/{args.slug}/submit-flag", {"flag": flag})
+    if d.get("correct"):
+        ok(f"Correct! {d.get('message', '')}")
+    else:
+        err(f"Wrong flag. {d.get('message', '')}")
+        sys.exit(1)
+
+# ── Commands: flag (smart submit) ─────────────────────────────────────────────
+
+def cmd_flag_submit(args):
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+
+    lab_d = _get("/api/labs/active").get("active_lab")
+    if lab_d:
+        slug = lab_d["lab_slug"]
+        info(f"Submitting to active lab: {lab_d['lab_name']}")
+        d = _post(f"/api/labs/{slug}/submit-flag", {"flag": flag})
+        (ok if d.get("correct") else err)(f"{'Correct!' if d.get('correct') else 'Wrong flag.'} {d.get('message','')}")
+        if not d.get("correct"): sys.exit(1)
+        return
+
+    ch_d = _get("/api/challenges/active").get("active_challenge")
+    if ch_d:
+        slug = ch_d["challenge_slug"]
+        info(f"Submitting to active challenge: {ch_d['challenge_name']}")
+        d = _post(f"/api/challenges/{slug}/submit-flag", {"flag": flag})
+        (ok if d.get("correct") else err)(f"{'Correct!' if d.get('correct') else 'Wrong flag.'} {d.get('message','')}")
+        if not d.get("correct"): sys.exit(1)
+        return
+
+    ev_d = _get("/api/events/active").get("active_event")
+    if ev_d:
+        event_id = ev_d.get("event_id")
+        info(f"Submitting to active event: {ev_d.get('package_name') or ev_d.get('name')}")
+        d = _post(f"/api/events/{event_id}/submit-flag", {"flag": flag})
+        (ok if d.get("correct") else err)(f"{'Correct!' if d.get('correct') else 'Wrong flag.'} {d.get('message','')}")
+        if not d.get("correct"): sys.exit(1)
+        return
+
+    err("No active lab, challenge, or event found. Start one first.")
+    sys.exit(1)
+
+# ── Commands: learning-paths ──────────────────────────────────────────────────
+
+def cmd_paths_list(_args):
+    data = _get("/api/learning-paths")
+    rows = []
+    for p in data:
+        rows.append([
+            p["slug"],
+            p["name"],
+            p.get("difficulty_tier", ""),
+            str(p.get("module_count", "")),
+            str(p.get("challenge_count", "")),
+            f"{p.get('estimated_hours','')}h",
+            str(p.get("total_xp", "")),
+            _bar(int(p.get("progress_pct", 0)), 100, 15),
+        ])
+    table(["Slug", "Name", "Tier", "Modules", "Challenges", "Est.", "XP", "Progress"], rows)
+
+def cmd_paths_show(args):
+    d = _get(f"/api/learning-paths/{args.slug}")
+    info(f"{d['name']} [{d['slug']}] — {d.get('difficulty_tier')}")
+    print(d.get("description", "").strip())
+    print()
+    info(f"Progress : {d.get('progress_pct',0)}%  ({d.get('modules_completed',0)}/{d.get('modules_total',0)} modules, {d.get('challenges_solved',0)} challenges)")
+    info(f"XP       : {d.get('xp_earned',0)}/{d.get('total_xp')}  |  Est: {d.get('estimated_hours')}h")
+    modules = d.get("modules", [])
+    if modules:
+        print()
+        info("Modules:")
+        rows = []
+        for m in modules:
+            rows.append([
+                m.get("slug",""),
+                m.get("name",""),
+                str(m.get("challenge_count","")),
+                _bar(m.get("solved_count",0), m.get("challenge_count",1), 12),
+            ])
+        table(["Slug", "Module", "Challenges", "Progress"], rows)
+
+# ── Commands: leaderboard ─────────────────────────────────────────────────────
+
+def cmd_leaderboard(args):
+    period = getattr(args, "period", None) or "weekly"
+    data = _get(f"/api/leaderboard/{period}")
+    entries = data.get("entries", [])[:25]
+    rows = []
+    for e in entries:
+        rows.append([
+            str(e.get("rank", "")),
+            e.get("username", ""),
+            str(e.get("xp", "")),
+            str(e.get("first_bloods", "")),
+            str(e.get("solve_streak", "")),
+        ])
+    info(f"Leaderboard — {period}")
+    table(["Rank", "Username", "XP", "First Bloods", "Streak"], rows)
+
+# ── Commands: vpn ─────────────────────────────────────────────────────────────
+
+def cmd_vpn_status(_args):
+    d = _get("/api/vpn/status")
+    if d.get("vpn_connected"):
+        ok(f"VPN connected — IP: {d.get('vpn_ip')}  ({d.get('vpn_proto')} @ {d.get('vpn_server_region')})")
+    else:
+        warn("VPN not connected.")
+    info(f"Cert expires: {_fmt_time(d.get('vpn_cert_expires_at', ''))}")
+
+def cmd_vpn_download(args):
+    data = _get_raw("/api/vpn/download")
+    dest = args.output or os.path.expanduser("~/webverselabs.ovpn")
+    Path(dest).write_bytes(data)
+    ok(f"Saved to {dest}  ({len(data)//1024} KB)")
+
+# ── Arg parser ────────────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="webversecli",
+        description="WebVerse Labs CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  webversecli config login                          # login with email+password
+  webversecli config login --email you@mail.com    # skip prompt
+  webversecli config set-token eyJ...              # set token directly
+  webversecli config logout
+
+  webversecli me                                   # profile
+  webversecli me stats                             # XP, rank, streaks, breakdown
+  webversecli me progress                          # completed labs/challenges
+  webversecli me achievements                      # unlocked achievements
+
+  webversecli labs list [--free] [--difficulty easy] [--tag sqli] [--search TEXT]
+  webversecli labs filters                         # available tags/techs/difficulties
+  webversecli labs show arcadenal
+  webversecli labs start arcadenal
+  webversecli labs active
+  webversecli labs stop
+  webversecli labs submit arcadenal WEBVERSE{flag}
+  webversecli labs writeup arcadenal [~/out.pdf]  # download PDF writeup
+
+  webversecli challenges list [--free] [--category sqli] [--difficulty easy] [--search TEXT]
+  webversecli challenges show gatekeeper
+  webversecli challenges start gatekeeper
+  webversecli challenges stop
+  webversecli challenges submit gatekeeper WEBVERSE{flag}
+
+  webversecli events list
+  webversecli events show the-caretaker
+  webversecli events start the-caretaker
+  webversecli events stop
+  webversecli events submit the-caretaker WEBVERSE{flag}
+
+  webversecli ranges list
+  webversecli ranges show bedrock
+
+  webversecli flag submit WEBVERSE{flag}           # auto-detect active
+  wl-paste | wvf                                   # clipboard → smart submit
+
+  webversecli learning-paths list
+  webversecli learning-paths show junior-web-hacker
+
+  webversecli leaderboard [weekly|monthly|all-time]
+
+  webversecli vpn status
+  webversecli vpn download [~/wv.ovpn]
+""")
+
+    sub = p.add_subparsers(dest="cmd")
+
+    # ── config ────────────────────────────────────────────────────────────────
+    cfg = sub.add_parser("config", help="Auth and configuration")
+    cfg_sub = cfg.add_subparsers(dest="cfg_action")
+
+    login_p = cfg_sub.add_parser("login", help="Login with email + password")
+    login_p.add_argument("--email", default="")
+    login_p.add_argument("--password", default="")
+
+    cfg_sub.add_parser("logout", help="Logout and clear token")
+
+    st = cfg_sub.add_parser("set-token", help="Set JWT token directly")
+    st.add_argument("token")
+
+    cfg_sub.add_parser("show", help="Show current token")
+
+    # ── me ────────────────────────────────────────────────────────────────────
+    me = sub.add_parser("me", help="User profile and stats")
+    me_sub = me.add_subparsers(dest="me_action")
+    me_sub.add_parser("stats",        help="XP, rank, streaks, difficulty breakdown")
+    me_sub.add_parser("progress",     help="Completed labs and challenges")
+    me_sub.add_parser("achievements", help="Unlocked achievements")
+
+    # ── labs ──────────────────────────────────────────────────────────────────
+    labs = sub.add_parser("labs", help="Lab management")
+    labs_sub = labs.add_subparsers(dest="labs_action")
+
+    ll = labs_sub.add_parser("list", help="List labs with optional filters")
+    ll.add_argument("--free",       action="store_true", help="Free labs only")
+    ll.add_argument("--difficulty", default="",          help="Filter: easy/medium/hard/master/foundational")
+    ll.add_argument("--tag",        default="",          help="Filter by tag (e.g. sqli, ssrf)")
+    ll.add_argument("--search",     default="",          help="Search name/description/tags")
+
+    labs_sub.add_parser("filters", help="Show available tags, techs, difficulties")
+
+    ls = labs_sub.add_parser("show",   help="Show lab details"); ls.add_argument("slug")
+    lstart = labs_sub.add_parser("start", help="Start a lab");  lstart.add_argument("slug")
+    labs_sub.add_parser("stop",   help="Stop active lab")
+    labs_sub.add_parser("active", help="Show active lab")
+
+    lsub = labs_sub.add_parser("submit", help="Submit a lab flag")
+    lsub.add_argument("slug")
+    lsub.add_argument("flag", nargs="?")
+
+    lwr = labs_sub.add_parser("writeup", help="Download lab writeup PDF (must be solved)")
+    lwr.add_argument("slug")
+    lwr.add_argument("output", nargs="?", help="Output path (default: ~/SLUG-writeup.pdf)")
+
+    # ── challenges ────────────────────────────────────────────────────────────
+    chals = sub.add_parser("challenges", help="Challenge management")
+    chals_sub = chals.add_subparsers(dest="chals_action")
+
+    cl = chals_sub.add_parser("list", help="List challenges with optional filters")
+    cl.add_argument("--free",       action="store_true")
+    cl.add_argument("--category",   default="", help="Filter by category (e.g. sqli, xss, idor)")
+    cl.add_argument("--difficulty", default="", help="Filter: easy/medium/hard/master")
+    cl.add_argument("--search",     default="", help="Search name/description/category")
+
+    cs = chals_sub.add_parser("show",   help="Show challenge details"); cs.add_argument("slug")
+    cstart = chals_sub.add_parser("start", help="Start a challenge");   cstart.add_argument("slug")
+    chals_sub.add_parser("stop",   help="Stop active challenge")
+    chals_sub.add_parser("active", help="Show active challenge")
+
+    csub = chals_sub.add_parser("submit", help="Submit a challenge flag")
+    csub.add_argument("slug")
+    csub.add_argument("flag", nargs="?")
+
+    # ── events ────────────────────────────────────────────────────────────────
+    evs = sub.add_parser("events", help="Daily / weekly events")
+    evs_sub = evs.add_subparsers(dest="evs_action")
+    evs_sub.add_parser("list",   help="List active events")
+    esh = evs_sub.add_parser("show",   help="Show event details"); esh.add_argument("slug")
+    estart = evs_sub.add_parser("start", help="Start an event");  estart.add_argument("slug")
+    evs_sub.add_parser("stop",   help="Stop active event")
+    evs_sub.add_parser("active", help="Show active event")
+    esub = evs_sub.add_parser("submit", help="Submit an event flag")
+    esub.add_argument("slug")
+    esub.add_argument("flag", nargs="?")
+
+    # ── ranges ────────────────────────────────────────────────────────────────
+    rngs = sub.add_parser("ranges", help="Ranges (multi-flag environments)")
+    rngs_sub = rngs.add_subparsers(dest="rngs_action")
+    rngs_sub.add_parser("list",   help="List ranges")
+    rsh = rngs_sub.add_parser("show",   help="Show range details"); rsh.add_argument("slug")
+    rstart = rngs_sub.add_parser("start", help="Start a range");    rstart.add_argument("slug")
+    rngs_sub.add_parser("stop",   help="Stop active range")
+    rngs_sub.add_parser("active", help="Show active range")
+    rsub = rngs_sub.add_parser("submit", help="Submit a range flag")
+    rsub.add_argument("slug")
+    rsub.add_argument("flag", nargs="?")
+
+    # ── flag (smart) ──────────────────────────────────────────────────────────
+    fl = sub.add_parser("flag", help="Smart flag submission (auto-detects active lab/challenge/event)")
+    fl_sub = fl.add_subparsers(dest="fl_action")
+    fls = fl_sub.add_parser("submit", help="Submit to whatever is currently active")
+    fls.add_argument("flag", nargs="?")
+
+    # ── learning-paths ────────────────────────────────────────────────────────
+    lp = sub.add_parser("learning-paths", help="Learning paths")
+    lp_sub = lp.add_subparsers(dest="lp_action")
+    lp_sub.add_parser("list", help="List learning paths")
+    lpsh = lp_sub.add_parser("show", help="Show path details and modules")
+    lpsh.add_argument("slug")
+
+    # ── leaderboard ───────────────────────────────────────────────────────────
+    lb = sub.add_parser("leaderboard", help="Leaderboard")
+    lb.add_argument("period", nargs="?", default="weekly",
+                    choices=["weekly", "monthly", "all-time"])
+
+    # ── vpn ───────────────────────────────────────────────────────────────────
+    vpn = sub.add_parser("vpn", help="VPN management")
+    vpn_sub = vpn.add_subparsers(dest="vpn_action")
+    vpn_sub.add_parser("status", help="VPN connection status")
+    vd = vpn_sub.add_parser("download", help="Download .ovpn config")
+    vd.add_argument("output", nargs="?")
+
+    return p
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.cmd == "config":
+        if   args.cfg_action == "login":     cmd_config_login(args)
+        elif args.cfg_action == "logout":    cmd_config_logout(args)
+        elif args.cfg_action == "set-token": cmd_config_set_token(args)
+        elif args.cfg_action == "show":      cmd_config_show(args)
+        else: parser.parse_args(["config", "--help"])
+
+    elif args.cmd == "me":
+        cmd_me(args)
+
+    elif args.cmd == "labs":
+        a = getattr(args, "labs_action", None)
+        if   a == "list":    cmd_labs_list(args)
+        elif a == "filters": cmd_labs_filters(args)
+        elif a == "show":    cmd_labs_show(args)
+        elif a == "start":   cmd_labs_start(args)
+        elif a == "stop":    cmd_labs_stop(args)
+        elif a == "active":  cmd_labs_active(args)
+        elif a == "submit":  cmd_labs_submit(args)
+        elif a == "writeup": cmd_labs_writeup(args)
+        else: parser.parse_args(["labs", "--help"])
+
+    elif args.cmd == "challenges":
+        a = getattr(args, "chals_action", None)
+        if   a == "list":   cmd_challenges_list(args)
+        elif a == "show":   cmd_challenges_show(args)
+        elif a == "start":  cmd_challenges_start(args)
+        elif a == "stop":   cmd_challenges_stop(args)
+        elif a == "active": cmd_challenges_active(args)
+        elif a == "submit": cmd_challenges_submit(args)
+        else: parser.parse_args(["challenges", "--help"])
+
+    elif args.cmd == "events":
+        a = getattr(args, "evs_action", None)
+        if   a == "list":   cmd_events_list(args)
+        elif a == "show":   cmd_events_show(args)
+        elif a == "start":  cmd_events_start(args)
+        elif a == "stop":   cmd_events_stop(args)
+        elif a == "active": cmd_events_active(args)
+        elif a == "submit": cmd_events_submit(args)
+        else: parser.parse_args(["events", "--help"])
+
+    elif args.cmd == "ranges":
+        a = getattr(args, "rngs_action", None)
+        if   a == "list":   cmd_ranges_list(args)
+        elif a == "show":   cmd_ranges_show(args)
+        elif a == "start":  cmd_ranges_start(args)
+        elif a == "stop":   cmd_ranges_stop(args)
+        elif a == "active": cmd_ranges_active(args)
+        elif a == "submit": cmd_ranges_submit(args)
+        else: parser.parse_args(["ranges", "--help"])
+
+    elif args.cmd == "flag":
+        if getattr(args, "fl_action", None) == "submit":
+            cmd_flag_submit(args)
+        else:
+            parser.parse_args(["flag", "--help"])
+
+    elif args.cmd == "learning-paths":
+        a = getattr(args, "lp_action", None)
+        if   a == "list": cmd_paths_list(args)
+        elif a == "show": cmd_paths_show(args)
+        else: parser.parse_args(["learning-paths", "--help"])
+
+    elif args.cmd == "leaderboard":
+        cmd_leaderboard(args)
+
+    elif args.cmd == "vpn":
+        a = getattr(args, "vpn_action", None)
+        if   a == "status":   cmd_vpn_status(args)
+        elif a == "download": cmd_vpn_download(args)
+        else: parser.parse_args(["vpn", "--help"])
+
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
