@@ -5,13 +5,14 @@ Unofficial CLI for [WebVerse Labs Pro](https://webverselabs-pro.com) — mirrors
 ## Install
 
 ```bash
-# clone
-git clone git@github.com:mHijuxS/webversecli.git
-cd webversecli
+git clone git@github.com:mHijuxS/webversecli.git ~/tools/webversecli
+ln -sf ~/tools/webversecli/webversecli ~/.local/bin/webversecli
+```
 
-# make executable and link to PATH
-chmod +x webversecli
-ln -sf "$PWD/webversecli" ~/.local/bin/webversecli
+## Update
+
+```bash
+git -C ~/tools/webversecli pull
 ```
 
 ## Auth
