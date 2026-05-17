@@ -139,16 +139,23 @@ def cmd_config_login(args):
     body = {"email": email, "password": password}
     try:
         data, resp = _req("/api/auth/login", "POST", body, raw=True, no_auth=True)
-        if resp.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
         parsed = json.loads(data)
     except SystemExit:
         return  # err() already printed
 
     token = parsed.get("token") or parsed.get("access_token") or parsed.get("jwt")
     if not token:
-        # Try to extract from Set-Cookie if returned in headers
-        err(f"Login succeeded but no token in response: {parsed}")
+        # Token may only be returned via Set-Cookie (HttpOnly), not in JSON body.
+        for cookie in resp.headers.get_all("Set-Cookie") or []:
+            for part in cookie.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "token" and v:
+                    token = v
+                    break
+            if token:
+                break
+    if not token:
+        err(f"Login succeeded but no token in response body or Set-Cookie: {parsed}")
         sys.exit(1)
 
     cfg = load_config()
@@ -356,7 +363,7 @@ def cmd_labs_writeup(args):
 
 def cmd_challenges_list(args):
     data = _get("/api/challenges")
-    rows = []
+    filtered = []
     for ch in data:
         if args.free and not ch.get("is_free"):
             continue
@@ -368,7 +375,35 @@ def cmd_challenges_list(args):
                                 _match(ch.get("description",""), args.search) or
                                 _match(ch.get("category",""), args.search)):
             continue
-        rows.append([
+        filtered.append(ch)
+
+    sort_mode = getattr(args, "sort", "") or ""
+    if sort_mode == "released":
+        # /api/challenges omits created_at; fetch detail per slug in parallel.
+        import concurrent.futures as _cf
+        def _fetch_created(ch):
+            try:
+                d = _get(f"/api/challenges/{ch['slug']}")
+                ch["created_at"] = d.get("created_at", "")
+            except SystemExit:
+                ch["created_at"] = ""
+            return ch
+        with _cf.ThreadPoolExecutor(max_workers=10) as _ex:
+            filtered = list(_ex.map(_fetch_created, filtered))
+        filtered.sort(key=lambda c: c.get("created_at") or "", reverse=True)
+    elif sort_mode == "solves":
+        filtered.sort(key=lambda c: c.get("total_solves") or 0, reverse=True)
+    elif sort_mode == "xp":
+        filtered.sort(key=lambda c: c.get("xp_reward") or 0, reverse=True)
+    elif sort_mode == "name":
+        filtered.sort(key=lambda c: (c.get("name") or "").lower())
+
+    headers = ["Slug", "Name", "Category", "Difficulty", "Access", "XP", "Solves"]
+    if sort_mode == "released":
+        headers.append("Released")
+    rows = []
+    for ch in filtered:
+        row = [
             ch["slug"],
             ch["name"][:38],
             ch.get("category", ""),
@@ -376,11 +411,14 @@ def cmd_challenges_list(args):
             _free_badge(ch.get("is_free", False)),
             str(ch.get("xp_reward", "")),
             str(ch.get("total_solves", "")),
-        ])
+        ]
+        if sort_mode == "released":
+            row.append((ch.get("created_at") or "")[:10])
+        rows.append(row)
     if not rows:
         info("No challenges match the given filters.")
         return
-    table(["Slug", "Name", "Category", "Difficulty", "Access", "XP", "Solves"], rows)
+    table(headers, rows)
     info(f"{len(rows)} challenge(s) shown.")
 
 def cmd_challenges_show(args):
@@ -773,6 +811,8 @@ Examples:
     cl.add_argument("--category",   default="", help="Filter by category (e.g. sqli, xss, idor)")
     cl.add_argument("--difficulty", default="", help="Filter: easy/medium/hard/master")
     cl.add_argument("--search",     default="", help="Search name/description/category")
+    cl.add_argument("--sort",       default="", choices=["", "released", "solves", "xp", "name"],
+                    help="Sort results (released = most recent first; requires per-challenge detail fetch)")
 
     cs = chals_sub.add_parser("show",   help="Show challenge details"); cs.add_argument("slug")
     cstart = chals_sub.add_parser("start", help="Start a challenge");   cstart.add_argument("slug")
