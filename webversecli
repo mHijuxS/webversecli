@@ -425,6 +425,11 @@ def cmd_challenges_show(args):
     d = _get(f"/api/challenges/{args.slug}")
     info(f"{d['name']} [{d['slug']}] — {d['difficulty']}")
     print(d.get("description", "").strip())
+    story = (d.get("story") or "").strip()
+    if story:
+        print()
+        info("Story:")
+        print(story)
     print()
     info(f"Category: {d.get('category')}  |  XP: {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
     info(f"Free: {d.get('is_free')}")
@@ -493,6 +498,11 @@ def cmd_events_show(args):
     d = _get(f"/api/events/{slug}")
     info(f"{d.get('package_name')} [{slug}] (ID {event_id}) — {d.get('difficulty')}")
     print(d.get("description", "").strip())
+    story = (d.get("story") or "").strip()
+    if story:
+        print()
+        info("Story:")
+        print(story)
     print()
     info(f"Category: {d.get('category')}  |  XP: {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
     info(f"Kind: {d.get('kind')}  |  State: {d.get('state')}")
