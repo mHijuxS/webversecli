@@ -124,15 +124,3 @@ webversecli vpn status
 webversecli vpn download              # saves to ~/webverselabs.ovpn
 webversecli vpn download ~/wv.ovpn   # custom path
 ```
-
-## API notes
-
-- Base URL: `https://api.webverselabs-pro.com`
-- Auth: `Cookie: token=<JWT>`
-- Cloudflare is active — standard browser headers are sent on every request
-- Events use numeric `event_id` for start/submit; the CLI resolves slugs to IDs automatically
-- Lab/challenge/challenge filtering is client-side (server returns all items)
-
-## Dependencies
-
-None — stdlib only (`urllib`, `json`, `gzip`, `argparse`, `getpass`). Requires Python 3.10+.
