@@ -102,21 +102,6 @@ webversecli ranges stop
 webversecli ranges submit <slug> [FLAG]
 ```
 
-### Smart flag submit
-
-Detects whatever is currently active (lab → challenge → event) and submits there:
-
-```bash
-webversecli flag submit WEBVERSE{...}
-wl-paste | webversecli flag submit   # pipe from clipboard
-```
-
-Add a shell alias for one-key submission (like `htbf` / `hcf`):
-
-```bash
-alias wvf='wl-paste | webversecli flag submit'
-```
-
 ### Learning paths
 
 ```bash
