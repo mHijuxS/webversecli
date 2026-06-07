@@ -544,6 +544,143 @@ def cmd_events_submit(args):
         err(f"Wrong flag. {d.get('message', '')}")
         sys.exit(1)
 
+# ── Commands: mystery challenges (retired daily/weekly events archive) ─────────
+# Served by /api/mystery-challenges (NOT /api/challenges or /api/events).
+# The list endpoint omits per-user solve state; detail carries `user_completed`.
+
+def _resolve_mystery(slug_or_id: str):
+    data = _get("/api/mystery-challenges")
+    for ev in data:
+        if (str(ev.get("event_id")) == str(slug_or_id) or
+                ev.get("slug") == slug_or_id or
+                ev.get("package_slug") == slug_or_id):
+            return ev["event_id"], ev.get("slug") or ev.get("package_slug")
+    err(f"Mystery challenge not found: {slug_or_id}")
+    sys.exit(1)
+
+def cmd_mystery_list(args):
+    data = _get("/api/mystery-challenges")
+    filtered = []
+    for ev in data:
+        if args.kind and ev.get("kind", "").lower() != args.kind.lower():
+            continue
+        if args.difficulty and ev.get("difficulty", "").lower() != args.difficulty.lower():
+            continue
+        if args.category and ev.get("category", "").lower() != args.category.lower():
+            continue
+        if args.search and not (_match(ev.get("name", ""), args.search) or
+                                _match(ev.get("description", ""), args.search) or
+                                _match(ev.get("category", ""), args.search)):
+            continue
+        filtered.append(ev)
+
+    # Solve-state lives only on the detail endpoint — fetch per slug in parallel.
+    want_status = args.unsolved or args.solved or args.status
+    if want_status:
+        import concurrent.futures as _cf
+        def _fetch_status(ev):
+            try:
+                d = _get(f"/api/mystery-challenges/{ev['slug']}")
+                ev["user_completed"] = bool(d.get("user_completed"))
+            except SystemExit:
+                ev["user_completed"] = None
+            return ev
+        with _cf.ThreadPoolExecutor(max_workers=10) as _ex:
+            filtered = list(_ex.map(_fetch_status, filtered))
+        if args.unsolved:
+            filtered = [e for e in filtered if e.get("user_completed") is False]
+        elif args.solved:
+            filtered = [e for e in filtered if e.get("user_completed") is True]
+
+    sort_mode = getattr(args, "sort", "") or "released"
+    if sort_mode == "solves":
+        filtered.sort(key=lambda e: e.get("total_solves") or 0, reverse=True)
+    elif sort_mode == "xp":
+        filtered.sort(key=lambda e: e.get("xp_reward") or 0, reverse=True)
+    elif sort_mode == "name":
+        filtered.sort(key=lambda e: (e.get("name") or "").lower())
+    else:  # released (default) — most recent first
+        filtered.sort(key=lambda e: e.get("starts_at") or "", reverse=True)
+
+    headers = ["Slug", "Name", "Kind", "Category", "Difficulty", "XP", "Solves"]
+    if want_status:
+        headers.append("Solved")
+    rows = []
+    for ev in filtered:
+        row = [
+            ev.get("slug") or ev.get("package_slug", ""),
+            (ev.get("name") or ev.get("package_name", ""))[:30],
+            ev.get("kind", ""),
+            ev.get("category", ""),
+            ev.get("difficulty", ""),
+            str(ev.get("xp_reward", "")),
+            str(ev.get("total_solves", "")),
+        ]
+        if want_status:
+            uc = ev.get("user_completed")
+            row.append(_c("32", "yes") if uc else (_c("90", "?") if uc is None else _c("33", "no")))
+        rows.append(row)
+    if not rows:
+        info("No mystery challenges match the given filters.")
+        return
+    table(headers, rows)
+    info(f"{len(rows)} mystery challenge(s) shown.")
+
+def cmd_mystery_show(args):
+    d = _get(f"/api/mystery-challenges/{args.slug}")
+    slug = d.get("package_slug") or args.slug
+    info(f"{d.get('package_name')} [{slug}] (ID {d.get('event_id')}) — {d.get('difficulty')}")
+    print((d.get("description") or "").strip())
+    story = (d.get("story") or "").strip()
+    if story:
+        print()
+        info("Story:")
+        print(story)
+    print()
+    info(f"Category: {d.get('category')}  |  XP: {d.get('xp_reward')}  |  Solves: {d.get('total_solves')}")
+    info(f"Kind: {d.get('kind')}  |  State: {d.get('state')}")
+    info(f"Released: {_fmt_time(d.get('created_at',''))}  |  Ended: {_fmt_time(d.get('ends_at',''))}")
+    if d.get("user_completed"):
+        ok(f"You have already solved this (at {_fmt_time(d.get('solved_at',''))}).")
+    else:
+        warn("Not solved yet.")
+    fb = d.get("first_blood")
+    if fb:
+        info(f"First blood: {fb.get('username')} @ {_fmt_time(fb.get('solved_at',''))}")
+
+def cmd_mystery_start(args):
+    event_id, _ = _resolve_mystery(args.slug)
+    d = _post(f"/api/mystery-challenges/{event_id}/start")
+    ok(f"Mystery challenge started: {d.get('package_name')}")
+    info(f"URL: {d.get('url')}")
+    if d.get("expires_at"):
+        info(f"Expires at: {_fmt_time(d.get('expires_at', ''))}")
+
+def cmd_mystery_stop(_args):
+    d = _post("/api/events/stop")  # shared stop endpoint for events + mystery
+    ok(d.get("message", "Stopped."))
+
+def cmd_mystery_active(_args):
+    d = _get("/api/events/active")
+    ev = d.get("active_event")
+    if not ev:
+        info("No active mystery/event instance.")
+        return
+    ok(f"Active: {ev.get('package_name') or ev.get('name')}")
+    info(f"URL: {ev.get('url')}")
+
+def cmd_mystery_submit(args):
+    event_id, _ = _resolve_mystery(args.slug)
+    flag = _read_flag(getattr(args, "flag", None))
+    if not flag:
+        err("No flag provided."); sys.exit(1)
+    d = _post(f"/api/mystery-challenges/{event_id}/submit-flag", {"flag": flag})
+    if d.get("correct"):
+        ok(f"Correct! {d.get('message', '')}")
+    else:
+        err(f"Wrong flag. {d.get('message', '')}")
+        sys.exit(1)
+
 # ── Commands: ranges ──────────────────────────────────────────────────────────
 
 def cmd_ranges_list(_args):
@@ -748,6 +885,13 @@ Examples:
   webversecli events stop
   webversecli events submit the-caretaker WEBVERSE{flag}
 
+  webversecli mystery list                          # retired daily/weekly archive
+  webversecli mystery list --unsolved               # only ones you haven't solved
+  webversecli mystery list --status --kind weekly   # weekly, with Solved column
+  webversecli mystery show bear
+  webversecli mystery start bear
+  webversecli mystery submit bear WEBVERSE{flag}
+
   webversecli ranges list
   webversecli ranges show bedrock
 
@@ -845,6 +989,27 @@ Examples:
     esub.add_argument("slug")
     esub.add_argument("flag", nargs="?")
 
+    # ── mystery ───────────────────────────────────────────────────────────────
+    mys = sub.add_parser("mystery", help="Mystery challenges (retired daily/weekly events archive)")
+    mys_sub = mys.add_subparsers(dest="mys_action")
+    ml = mys_sub.add_parser("list", help="List mystery challenges")
+    ml.add_argument("--unsolved",   action="store_true", help="Only unsolved (fetches solve-state per challenge)")
+    ml.add_argument("--solved",     action="store_true", help="Only solved")
+    ml.add_argument("--status",     action="store_true", help="Show Solved column without filtering")
+    ml.add_argument("--kind",       default="", help="Filter: daily/weekly")
+    ml.add_argument("--category",   default="", help="Filter by category (e.g. sqli, jwt, idor)")
+    ml.add_argument("--difficulty", default="", help="Filter: easy/medium/hard/master")
+    ml.add_argument("--search",     default="", help="Search name/description/category")
+    ml.add_argument("--sort",       default="", choices=["", "released", "solves", "xp", "name"],
+                    help="Sort results (default: released, most recent first)")
+    msh = mys_sub.add_parser("show", help="Show mystery challenge details"); msh.add_argument("slug")
+    mstart = mys_sub.add_parser("start", help="Start a mystery challenge"); mstart.add_argument("slug")
+    mys_sub.add_parser("stop",   help="Stop active mystery challenge")
+    mys_sub.add_parser("active", help="Show active mystery/event instance")
+    msub = mys_sub.add_parser("submit", help="Submit a mystery challenge flag")
+    msub.add_argument("slug")
+    msub.add_argument("flag", nargs="?")
+
     # ── ranges ────────────────────────────────────────────────────────────────
     rngs = sub.add_parser("ranges", help="Ranges (multi-flag environments)")
     rngs_sub = rngs.add_subparsers(dest="rngs_action")
@@ -931,6 +1096,16 @@ def main():
         elif a == "active": cmd_events_active(args)
         elif a == "submit": cmd_events_submit(args)
         else: parser.parse_args(["events", "--help"])
+
+    elif args.cmd == "mystery":
+        a = getattr(args, "mys_action", None)
+        if   a == "list":   cmd_mystery_list(args)
+        elif a == "show":   cmd_mystery_show(args)
+        elif a == "start":  cmd_mystery_start(args)
+        elif a == "stop":   cmd_mystery_stop(args)
+        elif a == "active": cmd_mystery_active(args)
+        elif a == "submit": cmd_mystery_submit(args)
+        else: parser.parse_args(["mystery", "--help"])
 
     elif args.cmd == "ranges":
         a = getattr(args, "rngs_action", None)

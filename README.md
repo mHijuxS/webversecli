@@ -91,6 +91,28 @@ webversecli events stop
 webversecli events submit <slug> [FLAG]
 ```
 
+### Mystery challenges (retired daily/weekly events archive)
+
+Past daily/weekly events stay playable in the "mystery challenges" archive
+(`/api/mystery-challenges`) — a different endpoint from `events`, so
+`events list` (active only) never shows them.
+
+```bash
+webversecli mystery list                       # whole archive (default sort: newest first)
+webversecli mystery list --unsolved            # only the ones you haven't solved
+webversecli mystery list --solved              # only solved
+webversecli mystery list --status              # all, with a Solved column
+webversecli mystery list --kind weekly --category sqli
+webversecli mystery show <slug>                # details + your solve state + first blood
+webversecli mystery start <slug>               # spins up an instance URL
+webversecli mystery active
+webversecli mystery stop
+webversecli mystery submit <slug> [FLAG]
+```
+
+> `--unsolved` / `--solved` / `--status` fetch per-challenge detail in parallel
+> (the list endpoint omits per-user solve state).
+
 ### Ranges (multi-flag environments)
 
 ```bash
