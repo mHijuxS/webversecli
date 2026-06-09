@@ -831,6 +831,126 @@ def cmd_leaderboard(args):
 
 # ── Commands: vpn ─────────────────────────────────────────────────────────────
 
+# ── Commands: tracks ──────────────────────────────────────────────────────────
+
+def _req_delete(path):
+    return _req(path, method="DELETE")
+
+def cmd_tracks_list(args):
+    data = _get("/api/tracks")
+
+    # Apply family/difficulty/search from list metadata first
+    filtered = []
+    for t in data:
+        if args.family and t.get("family", "").lower() != args.family.lower():
+            continue
+        if args.difficulty and t.get("difficulty", "").lower() != args.difficulty.lower():
+            continue
+        if args.search and not (_match(t.get("name", ""), args.search) or
+                                _match(t.get("description", ""), args.search) or
+                                _match(t.get("family", ""), args.search)):
+            continue
+        filtered.append(t)
+
+    # --enrolled requires live state from detail endpoint (list doesn't carry it)
+    if args.enrolled:
+        import concurrent.futures as _cf
+        def _fetch_state(t):
+            try:
+                d = _get(f"/api/tracks/{t['slug']}")
+                t["enrolled"] = bool(d.get("enrolled"))
+                t["liked"]    = bool(d.get("liked"))
+                t["completed"]      = bool(d.get("completed"))
+                t["completion_pct"] = d.get("completion_pct", 0)
+            except SystemExit:
+                pass
+            return t
+        with _cf.ThreadPoolExecutor(max_workers=8) as _ex:
+            filtered = list(_ex.map(_fetch_state, filtered))
+        filtered = [t for t in filtered if t.get("enrolled")]
+
+    rows = []
+    for t in filtered:
+        enrolled_badge = _c("32", "enrolled") if t.get("enrolled") else _c("90", "-")
+        liked_badge    = _c("33", "♥") if t.get("liked") else " "
+        done_badge     = _c("32", "done") if t.get("completed") else _c("90", f"{t.get('completion_pct',0)}%")
+        rows.append([
+            t["slug"],
+            t["name"],
+            t.get("difficulty", ""),
+            t.get("family", ""),
+            str(t.get("item_count", "")),
+            str(t.get("like_count", "")),
+            enrolled_badge,
+            liked_badge,
+            done_badge,
+        ])
+    if not rows:
+        info("No tracks match the given filters.")
+        return
+    table(["Slug", "Name", "Difficulty", "Family", "Items", "Likes", "Enrolled", "♥", "Progress"], rows)
+    info(f"{len(rows)} track(s) shown.")
+
+def cmd_tracks_show(args):
+    d = _get(f"/api/tracks/{args.slug}")
+    info(f"{d['name']} [{d['slug']}] — {d['difficulty']}  ({d.get('family','')})")
+    print()
+    print(d.get("description", "").strip())
+    print()
+    enrolled = "yes" if d.get("enrolled") else "no"
+    liked    = "yes" if d.get("liked") else "no"
+    info(f"Items    : {d.get('item_count')}  |  Likes: {d.get('like_count')}  |  Enrolled: {enrolled}  |  Liked: {liked}")
+    info(f"Progress : {d.get('completion_pct', 0)}%  {'(completed)' if d.get('completed') else ''}")
+    if d.get("curator_name"):
+        info(f"Curator  : {d['curator_name']}")
+    items = d.get("items", [])
+    if items:
+        print()
+        info("Items:")
+        rows = []
+        for it in items:
+            done = _c("32", "✓") if it.get("completed") else _c("90", "·")
+            rows.append([
+                done,
+                it.get("item_type", "")[:10],
+                it.get("slug", ""),
+                it.get("name", ""),
+                it.get("difficulty", ""),
+                str(it.get("xp_reward", "")),
+                _c("32", "free") if it.get("is_free") else _c("90", "pro"),
+            ])
+        table(["", "Type", "Slug", "Name", "Difficulty", "XP", "Access"], rows)
+
+def cmd_tracks_enroll(args):
+    d = _post(f"/api/tracks/{args.slug}/enroll")
+    if d.get("enrolled"):
+        ok(f"Enrolled in track: {args.slug}")
+    else:
+        warn(f"Response: {d}")
+
+def cmd_tracks_unenroll(args):
+    d = _req_delete(f"/api/tracks/{args.slug}/enroll")
+    if not d.get("enrolled"):
+        ok(f"Unenrolled from track: {args.slug}")
+    else:
+        warn(f"Response: {d}")
+
+def cmd_tracks_like(args):
+    d = _post(f"/api/tracks/{args.slug}/like")
+    if d.get("liked"):
+        ok(f"Liked track: {args.slug}  (total likes: {d.get('like_count','')})")
+    else:
+        warn(f"Response: {d}")
+
+def cmd_tracks_unlike(args):
+    d = _req_delete(f"/api/tracks/{args.slug}/like")
+    if not d.get("liked"):
+        ok(f"Unliked track: {args.slug}  (total likes: {d.get('like_count','')})")
+    else:
+        warn(f"Response: {d}")
+
+# ── Commands: vpn ─────────────────────────────────────────────────────────────
+
 def cmd_vpn_status(_args):
     d = _get("/api/vpn/status")
     if d.get("vpn_connected"):
@@ -852,7 +972,7 @@ def build_parser():
         prog="webversecli",
         description="WebVerse Labs CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=r"""
 Examples:
   webversecli config login                          # login with email+password
   webversecli config login --email you@mail.com    # skip prompt
@@ -903,11 +1023,20 @@ Examples:
 
   webversecli leaderboard [weekly|monthly|all-time]
 
+  webversecli tracks list                           # list all tracks
+  webversecli tracks list --enrolled               # only enrolled
+  webversecli tracks list --family injection       # filter by family
+  webversecli tracks show sqli-mastery             # detail + item list
+  webversecli tracks enroll sqli-mastery           # enroll in track
+  webversecli tracks unenroll sqli-mastery         # unenroll
+  webversecli tracks like sqli-mastery             # like a track
+  webversecli tracks unlike sqli-mastery           # unlike a track
+
   webversecli vpn status
   webversecli vpn download [~/wv.ovpn]
 """)
 
-    sub = p.add_subparsers(dest="cmd")
+    sub = p.add_subparsers(dest="cmd", metavar="{config,me,labs,challenges,events,mystery,ranges,tracks,flag,learning-paths,leaderboard,vpn}")
 
     # ── config ────────────────────────────────────────────────────────────────
     cfg = sub.add_parser("config", help="Auth and configuration")
@@ -1040,6 +1169,31 @@ Examples:
     lb.add_argument("period", nargs="?", default="weekly",
                     choices=["weekly", "monthly", "all-time"])
 
+    # ── tracks ────────────────────────────────────────────────────────────────
+    trks = sub.add_parser("tracks", help="Skill tracks (curated challenge/lab collections)")
+    trks_sub = trks.add_subparsers(dest="trks_action")
+
+    tl = trks_sub.add_parser("list", help="List all tracks")
+    tl.add_argument("--family",     default="", help="Filter by family (e.g. injection, foundations, cert-prep)")
+    tl.add_argument("--difficulty", default="", help="Filter: easy/medium/hard/foundational")
+    tl.add_argument("--enrolled",   action="store_true", help="Show only enrolled tracks")
+    tl.add_argument("--search",     default="", help="Search name/description/family")
+
+    tsh = trks_sub.add_parser("show", help="Show track details and item list")
+    tsh.add_argument("slug")
+
+    ten = trks_sub.add_parser("enroll", help="Enroll in a track")
+    ten.add_argument("slug")
+
+    tun = trks_sub.add_parser("unenroll", help="Unenroll from a track")
+    tun.add_argument("slug")
+
+    tlk = trks_sub.add_parser("like", help="Like a track")
+    tlk.add_argument("slug")
+
+    tulk = trks_sub.add_parser("unlike", help="Unlike a track")
+    tulk.add_argument("slug")
+
     # ── vpn ───────────────────────────────────────────────────────────────────
     vpn = sub.add_parser("vpn", help="VPN management")
     vpn_sub = vpn.add_subparsers(dest="vpn_action")
@@ -1131,6 +1285,16 @@ def main():
 
     elif args.cmd == "leaderboard":
         cmd_leaderboard(args)
+
+    elif args.cmd == "tracks":
+        a = getattr(args, "trks_action", None)
+        if   a == "list":     cmd_tracks_list(args)
+        elif a == "show":     cmd_tracks_show(args)
+        elif a == "enroll":   cmd_tracks_enroll(args)
+        elif a == "unenroll": cmd_tracks_unenroll(args)
+        elif a == "like":     cmd_tracks_like(args)
+        elif a == "unlike":   cmd_tracks_unlike(args)
+        else: parser.parse_args(["tracks", "--help"])
 
     elif args.cmd == "vpn":
         a = getattr(args, "vpn_action", None)
