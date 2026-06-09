@@ -6,6 +6,7 @@ import getpass
 import gzip
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -25,15 +26,19 @@ def err(msg):  print(_c("31", f"[-] {msg}"), file=sys.stderr)
 def info(msg): print(_c("36", f"[*] {msg}"))
 def warn(msg): print(_c("33", f"[!] {msg}"))
 
+_ANSI_RE = re.compile(r'\033\[[0-9;]*m')
+def _vlen(s): return len(_ANSI_RE.sub('', str(s)))
+def _pad(s, width): return str(s) + ' ' * max(0, width - _vlen(s))
+
 def table(headers, rows):
     if not rows:
         return
-    widths = [max(len(str(r[i])) for r in ([headers] + rows)) for i in range(len(headers))]
+    widths = [max(_vlen(r[i]) for r in ([headers] + rows)) for i in range(len(headers))]
     sep = "  "
-    print(_c("1", sep.join(str(h).ljust(widths[i]) for i, h in enumerate(headers))))
+    print(_c("1", sep.join(_pad(h, widths[i]) for i, h in enumerate(headers))))
     print(_c("90", sep.join("-" * w for w in widths)))
     for row in rows:
-        print(sep.join(str(v).ljust(widths[i]) for i, v in enumerate(row)))
+        print(sep.join(_pad(v, widths[i]) for i, v in enumerate(row)))
 
 # ── Config management ─────────────────────────────────────────────────────────
 
