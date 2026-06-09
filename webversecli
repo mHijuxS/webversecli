@@ -909,10 +909,13 @@ def cmd_tracks_show(args):
         info("Items:")
         rows = []
         for it in items:
-            done = _c("32", "✓") if it.get("completed") else _c("90", "·")
+            done = _c("32", "solved") if it.get("completed") else _c("90", "-")
+            raw_type = it.get("item_type", "")
+            # foundational_lab → show as "lab"; "foundational" already appears in Difficulty
+            display_type = "lab" if raw_type == "foundational_lab" else raw_type[:10]
             rows.append([
                 done,
-                it.get("item_type", "")[:10],
+                display_type,
                 it.get("slug", ""),
                 it.get("name", ""),
                 it.get("difficulty", ""),
