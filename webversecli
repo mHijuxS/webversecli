@@ -327,6 +327,7 @@ def cmd_labs_start(args):
     info(f"Hostnames  : {', '.join(d.get('hostnames', []))}")
     info(f"Hosts entry: {d.get('hosts_file_entry')}")
     info(f"Expires at : {_fmt_time(d.get('expires_at', ''))}")
+    _print_interact(d, "/api/labs/active")
 
 def cmd_labs_stop(_args):
     d = _post("/api/labs/stop")
@@ -344,6 +345,7 @@ def cmd_labs_active(_args):
     info(f"Hosts entry: {lab.get('hosts_file_entry')}")
     info(f"Expires at : {_fmt_time(lab.get('expires_at', ''))}")
     info(f"Status     : {lab.get('status')}")
+    _print_interact(lab)
 
 def cmd_labs_submit(args):
     flag = _read_flag(getattr(args, "flag", None))
@@ -426,6 +428,37 @@ def cmd_challenges_list(args):
     table(headers, rows)
     info(f"{len(rows)} challenge(s) shown.")
 
+def _print_interact(d, fetch_active=None):
+    """Surface the OOB interaction-catcher URL when the platform exposes one.
+
+    Bot-driven challenges (csrf / xss / ssrf, password-reset poisoning, etc.)
+    require an out-of-band catcher that the challenge bot can reach; the API
+    returns it as `interact_url` / `interact_subdomain`, but most commands drop
+    it. Surfacing it lets automated solves discover the catcher and watch
+    `<interact_url>/__interactions__` for bot callbacks. The `start` response
+    often omits it, so fall back to the matching `active` endpoint.
+    """
+    def _extract(obj):
+        if not isinstance(obj, dict):
+            return None
+        url = obj.get("interact_url")
+        if not url and obj.get("interact_subdomain"):
+            url = f"https://{obj['interact_subdomain']}.interact.webverselabs-pro.com"
+        return url
+
+    url = _extract(d)
+    if not url and fetch_active:
+        try:
+            a = _get(fetch_active)
+            inner = (a.get("active_challenge") or a.get("active_event")
+                     or a.get("active_lab") or a)
+            url = _extract(inner)
+        except Exception:
+            url = None
+    if url:
+        info(f"Interact URL: {url}")
+        info(f"  (OOB catcher — watch {url}/__interactions__ for bot callbacks)")
+
 def cmd_challenges_show(args):
     d = _get(f"/api/challenges/{args.slug}")
     info(f"{d['name']} [{d['slug']}] — {d['difficulty']}")
@@ -444,6 +477,7 @@ def cmd_challenges_start(args):
     ok(f"Challenge started: {d.get('challenge_name')}")
     info(f"URL: {d.get('url')}")
     info(f"Expires at: {_fmt_time(d.get('expires_at', ''))}")
+    _print_interact(d, "/api/challenges/active")
 
 def cmd_challenges_stop(_args):
     d = _post("/api/challenges/stop")
@@ -458,6 +492,7 @@ def cmd_challenges_active(_args):
     ok(f"Active challenge: {ch['challenge_name']}")
     info(f"URL: {ch.get('url')}")
     info(f"Expires at: {_fmt_time(ch.get('expires_at', ''))}")
+    _print_interact(ch)
 
 def cmd_challenges_submit(args):
     flag = _read_flag(getattr(args, "flag", None))
@@ -523,6 +558,7 @@ def cmd_events_start(args):
     d = _post(f"/api/events/{event_id}/start")
     ok(f"Event started: {d.get('package_name')}")
     info(f"URL: {d.get('url')}")
+    _print_interact(d, "/api/events/active")
 
 def cmd_events_stop(_args):
     d = _post("/api/events/stop")
@@ -536,6 +572,7 @@ def cmd_events_active(_args):
         return
     ok(f"Active event: {ev.get('package_name') or ev.get('name')}")
     info(f"URL: {ev.get('url')}")
+    _print_interact(ev)
 
 def cmd_events_submit(args):
     event_id, _ = _resolve_event(args.slug)
@@ -660,6 +697,7 @@ def cmd_mystery_start(args):
     info(f"URL: {d.get('url')}")
     if d.get("expires_at"):
         info(f"Expires at: {_fmt_time(d.get('expires_at', ''))}")
+    _print_interact(d, "/api/events/active")
 
 def cmd_mystery_stop(_args):
     d = _post("/api/events/stop")  # shared stop endpoint for events + mystery
@@ -673,6 +711,7 @@ def cmd_mystery_active(_args):
         return
     ok(f"Active: {ev.get('package_name') or ev.get('name')}")
     info(f"URL: {ev.get('url')}")
+    _print_interact(ev)
 
 def cmd_mystery_submit(args):
     event_id, _ = _resolve_mystery(args.slug)
